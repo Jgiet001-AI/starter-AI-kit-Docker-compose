@@ -1,4 +1,4 @@
-version: '3.9'  # It's often best to use the highest 3.x version (e.g. 3.9) for maximum feature support
+version: '3.11'  # It's often best to use the highest 3.x version (e.g. 3.11) for maximum feature support
 
 ###############################################################################
 #                               NETWORKS                                      #
