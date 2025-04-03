@@ -1,0 +1,216 @@
+version: '3.9'  # It's often best to use the highest 3.x version (e.g. 3.9) for maximum feature support
+
+###############################################################################
+#                               NETWORKS                                      #
+###############################################################################
+networks:
+  demo:
+
+###############################################################################
+#                               VOLUMES                                       #
+###############################################################################
+volumes:
+  n8n_storage:
+  postgres_storage:
+  ollama_storage:
+  qdrant_storage:
+  open-webui:
+
+###############################################################################
+#                               SERVICE ANCHORS                               #
+###############################################################################
+x-n8n: &service-n8n
+  image: n8nio/n8n:latest
+  networks: ['demo']
+  environment:
+    - DB_TYPE=postgresdb
+    - DB_POSTGRESDB_HOST=postgres
+    - DB_POSTGRESDB_USER=${POSTGRES_USER}
+    - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    - N8N_DIAGNOSTICS_ENABLED=false
+    - N8N_PERSONALIZATION_ENABLED=false
+    - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}        # Make sure to define in .env
+    - N8N_USER_MANAGEMENT_JWT_SECRET=${N8N_USER_MANAGEMENT_JWT_SECRET}
+    - OLLAMA_HOST=ollama:11434
+  env_file:
+    - .env
+
+x-ollama: &service-ollama
+  image: ollama/ollama:${OLLAMA_DOCKER_TAG:-latest}  # Fallback to 'latest' if OLLAMA_DOCKER_TAG isn't set
+  container_name: ollama
+  networks: ['demo']
+  restart: unless-stopped
+  ports:
+    - 11434:11434
+  volumes:
+    - ollama_storage:/root/.ollama
+  tty: true
+  pull_policy: always
+
+x-init-ollama: &init-ollama
+  image: ollama/ollama:latest
+  networks: ['demo']
+  # container_name intentionally different so it doesn't conflict with *service-ollama
+  volumes:
+    - ollama_storage:/root/.ollama
+  entrypoint: /bin/sh
+  environment:
+    - OLLAMA_HOST=ollama:11434
+  command:
+    - "-c"
+    - "sleep 3; ollama pull llama3.2"
+
+###############################################################################
+#                               SERVICES                                      #
+###############################################################################
+services:
+  #############################################################################
+  # PostgreSQL
+  #############################################################################
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    networks: ['demo']
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_storage:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  #############################################################################
+  # n8n Import (one-time)
+  #############################################################################
+  n8n-import:
+    <<: *service-n8n
+    hostname: n8n-import
+    container_name: n8n-import
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - "n8n import:credentials --separate --input=/backup/credentials && n8n import:workflow --separate --input=/backup/workflows"
+    volumes:
+      - ./n8n/backup:/backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Typically you would not restart this container unless you want to re-import.
+
+  #############################################################################
+  # n8n (main service)
+  #############################################################################
+  n8n:
+    <<: *service-n8n
+    hostname: n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - 5678:5678
+    volumes:
+      - n8n_storage:/home/node/.n8n
+      - ./n8n/backup:/backup
+      - ./shared:/data/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n-import:
+        # "service_completed_successfully" is recognized in newer Docker Compose versions.
+        # If you get an error on older versions, remove or change to something like service_healthy.
+        condition: service_completed_successfully
+
+  #############################################################################
+  # Qdrant
+  #############################################################################
+  qdrant:
+    image: qdrant/qdrant
+    hostname: qdrant
+    container_name: qdrant
+    networks: ['demo']
+    restart: unless-stopped
+    ports:
+      - 6333:6333
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  #############################################################################
+  # Ollama CPU
+  #############################################################################
+  ollama-cpu:
+    <<: *service-ollama
+    profiles: ["cpu"]
+
+  #############################################################################
+  # Ollama GPU (NVIDIA)
+  #############################################################################
+  ollama-gpu:
+    <<: *service-ollama
+    profiles: ["gpu-nvidia"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  #############################################################################
+  # Ollama GPU (AMD)
+  #############################################################################
+  ollama-gpu-amd:
+    <<: *service-ollama
+    profiles: ["gpu-amd"]
+    image: ollama/ollama:rocm
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"
+
+  #############################################################################
+  # Containers to pull LLaMA model
+  #############################################################################
+  ollama-pull-llama-cpu:
+    <<: *init-ollama
+    profiles: ["cpu"]
+    container_name: ollama-pull-llama-cpu
+    depends_on:
+      - ollama-cpu
+
+  ollama-pull-llama-gpu:
+    <<: *init-ollama
+    profiles: ["gpu-nvidia"]
+    container_name: ollama-pull-llama-gpu
+    depends_on:
+      - ollama-gpu
+
+  ollama-pull-llama-gpu-amd:
+    <<: *init-ollama
+    profiles: ["gpu-amd"]
+    container_name: ollama-pull-llama-gpu-amd
+    depends_on:
+      - ollama-gpu-amd
+
+  #############################################################################
+  # Open WebUI
+  #############################################################################
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    networks: ['demo']
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      - ollama-cpu   # This ensures the CPU version of ollama is running
+    environment:
+      - OLLAMA_BASE_URL=http://ollama-cpu:11434
+      - WEBUI_SECRET_KEY=
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    profiles: ["cpu"]
